@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +20,23 @@ type RoomSummary struct {
 	MaxPlayers int       `json:"maxPlayers"`
 	Players    int       `json:"players"`
 	InGame     bool      `json:"inGame"`
+	OwnerID    string    `json:"ownerId"`
+	OwnerName  string    `json:"ownerName"`
+	AdminCount int       `json:"adminCount"`
 	CreatedAt  time.Time `json:"createdAt"`
+}
+
+type RoomPlayerSummary struct {
+	PlayerID string `json:"playerId"`
+	Name     string `json:"name"`
+	Slot     int    `json:"slot"`
+	IsOwner  bool   `json:"isOwner"`
+	IsAdmin  bool   `json:"isAdmin"`
+}
+
+type RoomDetail struct {
+	RoomSummary
+	Members []RoomPlayerSummary `json:"members"`
 }
 
 type Manager struct {
@@ -81,6 +98,7 @@ func (m *Manager) Create(code, title string, maxPlayers int) (*Room, error) {
 		Income:     m.cfg.DefaultIncome,
 		CreatedAt:  time.Now(),
 		players:    make([]*Session, maxPlayers),
+		adminIDs:   make(map[string]bool),
 	}
 	m.rooms[normalized] = room
 	return room, nil
@@ -152,12 +170,18 @@ type Room struct {
 	Income     float32
 	CreatedAt  time.Time
 
-	mu      sync.RWMutex
-	InGame  bool
-	players []*Session
+	mu       sync.RWMutex
+	InGame   bool
+	OwnerID  string
+	players  []*Session
+	adminIDs map[string]bool
 }
 
 func (r *Room) Summary() RoomSummary {
+	ownerName := ""
+	if owner := r.FindByPlayerID(r.OwnerID); owner != nil {
+		ownerName = owner.name
+	}
 	return RoomSummary{
 		Code:       r.Code,
 		Title:      r.Title,
@@ -165,7 +189,50 @@ func (r *Room) Summary() RoomSummary {
 		MaxPlayers: r.MaxPlayers,
 		Players:    r.PlayerCount(),
 		InGame:     r.IsInGame(),
+		OwnerID:    r.OwnerID,
+		OwnerName:  ownerName,
+		AdminCount: r.AdminCount(),
 		CreatedAt:  r.CreatedAt,
+	}
+}
+
+func (r *Room) Detail() RoomDetail {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	members := make([]RoomPlayerSummary, 0, len(r.players))
+	ownerName := ""
+	for _, session := range r.players {
+		if session == nil {
+			continue
+		}
+		isOwner := session.playerID == r.OwnerID
+		if isOwner {
+			ownerName = session.name
+		}
+		members = append(members, RoomPlayerSummary{
+			PlayerID: session.playerID,
+			Name:     session.name,
+			Slot:     session.Slot(),
+			IsOwner:  isOwner,
+			IsAdmin:  r.adminIDs[session.playerID],
+		})
+	}
+
+	return RoomDetail{
+		RoomSummary: RoomSummary{
+			Code:       r.Code,
+			Title:      r.Title,
+			MapName:    r.MapName,
+			MaxPlayers: r.MaxPlayers,
+			Players:    len(members),
+			InGame:     r.InGame,
+			OwnerID:    r.OwnerID,
+			OwnerName:  ownerName,
+			AdminCount: len(r.adminIDs),
+			CreatedAt:  r.CreatedAt,
+		},
+		Members: members,
 	}
 }
 
@@ -177,6 +244,10 @@ func (r *Room) Join(session *Session) error {
 		if existing == nil {
 			r.players[idx] = session
 			session.setRoom(r, idx)
+			if r.OwnerID == "" {
+				r.OwnerID = session.playerID
+				r.adminIDs[session.playerID] = true
+			}
 			return nil
 		}
 	}
@@ -190,6 +261,11 @@ func (r *Room) Leave(session *Session) {
 	for idx, existing := range r.players {
 		if existing == session {
 			r.players[idx] = nil
+			delete(r.adminIDs, session.playerID)
+			if r.OwnerID == session.playerID {
+				r.OwnerID = ""
+				r.promoteSuccessorLocked()
+			}
 			if r.PlayerCountLocked() == 0 {
 				r.InGame = false
 			}
@@ -232,6 +308,162 @@ func (r *Room) IsInGame() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.InGame
+}
+
+func (r *Room) IsOwner(session *Session) bool {
+	if session == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return session.playerID != "" && session.playerID == r.OwnerID
+}
+
+func (r *Room) IsAdmin(session *Session) bool {
+	if session == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.adminIDs[session.playerID]
+}
+
+func (r *Room) CanModerate(session *Session) bool {
+	return r.IsAdmin(session)
+}
+
+func (r *Room) AdminCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.adminIDs)
+}
+
+func (r *Room) FindByPlayerID(playerID string) *Session {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, session := range r.players {
+		if session != nil && session.playerID == playerID {
+			return session
+		}
+	}
+	return nil
+}
+
+func (r *Room) TransferOwnership(actor, target *Session) error {
+	if actor == nil || target == nil {
+		return fmt.Errorf("actor or target is nil")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if actor.playerID != r.OwnerID {
+		return fmt.Errorf("only owner can transfer ownership")
+	}
+	if !r.containsLocked(target) {
+		return fmt.Errorf("target is not in room")
+	}
+	r.OwnerID = target.playerID
+	r.adminIDs[target.playerID] = true
+	return nil
+}
+
+func (r *Room) SetAdmin(actor, target *Session, value bool) error {
+	if actor == nil || target == nil {
+		return fmt.Errorf("actor or target is nil")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if actor.playerID != r.OwnerID {
+		return fmt.Errorf("only owner can manage admins")
+	}
+	if !r.containsLocked(target) {
+		return fmt.Errorf("target is not in room")
+	}
+	if value {
+		r.adminIDs[target.playerID] = true
+		return nil
+	}
+	if target.playerID == r.OwnerID {
+		return fmt.Errorf("owner cannot be removed from admins")
+	}
+	delete(r.adminIDs, target.playerID)
+	return nil
+}
+
+func (r *Room) Kick(actor, target *Session) error {
+	if actor == nil || target == nil {
+		return fmt.Errorf("actor or target is nil")
+	}
+	r.mu.RLock()
+	canModerate := r.adminIDs[actor.playerID]
+	actorIsOwner := actor.playerID == r.OwnerID
+	targetIsOwner := target.playerID == r.OwnerID
+	targetIsAdmin := r.adminIDs[target.playerID]
+	r.mu.RUnlock()
+
+	if !canModerate {
+		return fmt.Errorf("only admins can kick players")
+	}
+	if targetIsOwner && !actorIsOwner {
+		return fmt.Errorf("only owner can kick current owner")
+	}
+	if targetIsAdmin && !actorIsOwner {
+		return fmt.Errorf("only owner can kick another admin")
+	}
+
+	target.systemMessage("你已被移出房间。")
+	target.close()
+	return nil
+}
+
+func (r *Room) FindTarget(input string) (*Session, error) {
+	normalized := strings.TrimSpace(input)
+	if normalized == "" {
+		return nil, fmt.Errorf("missing target")
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if slot, err := parseSlot(normalized); err == nil {
+		if slot >= 0 && slot < len(r.players) && r.players[slot] != nil {
+			return r.players[slot], nil
+		}
+	}
+
+	var exact *Session
+	for _, session := range r.players {
+		if session == nil {
+			continue
+		}
+		if strings.EqualFold(session.name, normalized) || session.playerID == normalized {
+			if exact != nil {
+				return nil, fmt.Errorf("multiple players matched target")
+			}
+			exact = session
+		}
+	}
+	if exact == nil {
+		return nil, fmt.Errorf("target not found")
+	}
+	return exact, nil
+}
+
+func (r *Room) MembersText() string {
+	detail := r.Detail()
+	if len(detail.Members) == 0 {
+		return "当前房间为空"
+	}
+	lines := make([]string, 0, len(detail.Members))
+	for _, member := range detail.Members {
+		role := "player"
+		if member.IsOwner {
+			role = "owner"
+		} else if member.IsAdmin {
+			role = "admin"
+		}
+		lines = append(lines, fmt.Sprintf("[%d] %s (%s)", member.Slot, member.Name, role))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (r *Room) broadcast(packet protocol.Packet) {
@@ -303,7 +535,7 @@ func (r *Room) buildTeamListPacket(player *Session) (protocol.Packet, error) {
 				return err
 			}
 			section.Raw(make([]byte, 32))
-			if member.Slot() == 0 {
+			if member.playerID == r.OwnerID {
 				section.Int32(1)
 			} else {
 				section.Int32(0)
@@ -363,6 +595,36 @@ func defaultIfBlank(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func parseSlot(value string) (int, error) {
+	value = strings.TrimPrefix(strings.TrimSpace(value), "#")
+	return strconv.Atoi(value)
+}
+
+func (r *Room) containsLocked(target *Session) bool {
+	for _, member := range r.players {
+		if member == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Room) promoteSuccessorLocked() {
+	for _, member := range r.players {
+		if member != nil && r.adminIDs[member.playerID] {
+			r.OwnerID = member.playerID
+			return
+		}
+	}
+	for _, member := range r.players {
+		if member != nil {
+			r.OwnerID = member.playerID
+			r.adminIDs[member.playerID] = true
+			return
+		}
+	}
 }
 
 func max(a, b int) int {

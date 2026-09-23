@@ -262,6 +262,10 @@ func (s *Session) handleChat(body []byte) error {
 		return nil
 	}
 
+	if strings.HasPrefix(strings.TrimSpace(message), "/") {
+		return s.handleRoomCommand(room, strings.TrimSpace(message))
+	}
+
 	room.broadcastChat(s.name, message)
 	return nil
 }
@@ -271,7 +275,12 @@ func (s *Session) handleStartGame(packet protocol.Packet) error {
 	if room == nil {
 		return nil
 	}
+	if !room.CanModerate(s) {
+		s.systemMessage("只有房主或管理员可以开始游戏。")
+		return nil
+	}
 	room.SetInGame(true)
+	room.broadcastSystem(fmt.Sprintf("%s 开始了游戏", s.name))
 	room.broadcast(packet)
 	return nil
 }
@@ -320,6 +329,88 @@ func (s *Session) joinRoom(code string) error {
 	return room.broadcastTeamList()
 }
 
+func (s *Session) handleRoomCommand(room *Room, message string) error {
+	fields := strings.Fields(message)
+	if len(fields) == 0 {
+		return nil
+	}
+
+	switch strings.ToLower(fields[0]) {
+	case "/help":
+		s.systemMessage("可用命令: /players, /kick <槽位|玩家名>, /owner <槽位|玩家名>, /admin add|remove <槽位|玩家名>")
+	case "/players", "/list":
+		s.systemMessage(room.MembersText())
+	case "/kick":
+		if len(fields) < 2 {
+			s.systemMessage("用法: /kick <槽位|玩家名>")
+			return nil
+		}
+		target, err := room.FindTarget(strings.Join(fields[1:], " "))
+		if err != nil {
+			s.systemMessage(err.Error())
+			return nil
+		}
+		if target == s {
+			s.systemMessage("不能踢出自己。")
+			return nil
+		}
+		if err := room.Kick(s, target); err != nil {
+			s.systemMessage(err.Error())
+			return nil
+		}
+		room.broadcastSystem(fmt.Sprintf("%s 移出了 %s", s.name, target.name))
+	case "/owner", "/transfer":
+		if len(fields) < 2 {
+			s.systemMessage("用法: /owner <槽位|玩家名>")
+			return nil
+		}
+		target, err := room.FindTarget(strings.Join(fields[1:], " "))
+		if err != nil {
+			s.systemMessage(err.Error())
+			return nil
+		}
+		if err := room.TransferOwnership(s, target); err != nil {
+			s.systemMessage(err.Error())
+			return nil
+		}
+		room.broadcastSystem(fmt.Sprintf("%s 将房主转移给了 %s", s.name, target.name))
+		_ = room.broadcastTeamList()
+	case "/admin":
+		if len(fields) < 3 {
+			s.systemMessage("用法: /admin add|remove <槽位|玩家名>")
+			return nil
+		}
+		action := strings.ToLower(fields[1])
+		target, err := room.FindTarget(strings.Join(fields[2:], " "))
+		if err != nil {
+			s.systemMessage(err.Error())
+			return nil
+		}
+		switch action {
+		case "add":
+			if err := room.SetAdmin(s, target, true); err != nil {
+				s.systemMessage(err.Error())
+				return nil
+			}
+			room.broadcastSystem(fmt.Sprintf("%s 设定 %s 为管理员", s.name, target.name))
+			_ = room.broadcastTeamList()
+		case "remove":
+			if err := room.SetAdmin(s, target, false); err != nil {
+				s.systemMessage(err.Error())
+				return nil
+			}
+			room.broadcastSystem(fmt.Sprintf("%s 取消了 %s 的管理员", s.name, target.name))
+			_ = room.broadcastTeamList()
+		default:
+			s.systemMessage("用法: /admin add|remove <槽位|玩家名>")
+		}
+	default:
+		s.systemMessage("未知房间命令，使用 /help 查看可用命令。")
+	}
+
+	return nil
+}
+
 func (s *Session) Send(packet protocol.Packet) error {
 	select {
 	case <-s.closeCh:
@@ -327,6 +418,15 @@ func (s *Session) Send(packet protocol.Packet) error {
 	case s.send <- packet:
 		return nil
 	}
+}
+
+func (s *Session) systemMessage(message string) {
+	room := s.Room()
+	sender := "SERVER"
+	if room != nil {
+		sender = "ROOM"
+	}
+	_ = s.Send(buildChatPacket(sender, message, 5))
 }
 
 func (s *Session) close() {

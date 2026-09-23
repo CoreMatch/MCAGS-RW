@@ -26,6 +26,15 @@ func Router(rooms *relay.Manager) *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"rooms": rooms.List()})
 	})
 
+	engine.GET("/api/rooms/:code", func(c *gin.Context) {
+		room, ok := rooms.Get(c.Param("code"))
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "room not found"})
+			return
+		}
+		c.JSON(http.StatusOK, room.Detail())
+	})
+
 	engine.POST("/api/rooms", func(c *gin.Context) {
 		var req roomCreateRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
