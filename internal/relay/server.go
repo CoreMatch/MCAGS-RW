@@ -16,26 +16,23 @@ import (
 	"time"
 
 	"rwgin/internal/config"
+	"rwgin/internal/game"
 	"rwgin/internal/protocol"
 )
 
 type Server struct {
-	cfg      config.Config
-	logger   *log.Logger
-	rooms    *Manager
-	listener net.Listener
+	cfg          config.Config
+	logger       *log.Logger
+	gameSessions *game.SessionManager
+	listener     net.Listener
 }
 
 func NewServer(cfg config.Config, logger *log.Logger) *Server {
 	return &Server{
-		cfg:    cfg,
-		logger: logger,
-		rooms:  NewManager(cfg),
+		cfg:          cfg,
+		logger:       logger,
+		gameSessions: game.NewSessionManager(),
 	}
-}
-
-func (s *Server) Rooms() *Manager {
-	return s.rooms
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -97,9 +94,9 @@ type Session struct {
 	clientVersion int
 	preregister   protocol.PreregisterInfo
 
-	roomMu sync.RWMutex
-	room   *Room
-	slot   int
+	roomMu      sync.RWMutex
+	gameSession *game.Session
+	slot        int
 }
 
 var sessionCounter atomic.Uint64
@@ -417,8 +414,8 @@ func (s *Session) handlePromptReply(body []byte) error {
 }
 
 func (s *Session) handleChat(body []byte) error {
-	room := s.Room()
-	if room == nil {
+	gameSession := s.GameSession()
+	if gameSession == nil {
 		return nil
 	}
 
@@ -430,197 +427,59 @@ func (s *Session) handleChat(body []byte) error {
 		return nil
 	}
 
-	if strings.HasPrefix(strings.TrimSpace(message), "/") {
-		return s.handleRoomCommand(room, strings.TrimSpace(message))
-	}
+	// TODO: Implement chat handling in game.Session
+	s.server.logger.Printf("chat in session %s from %s: %s", gameSession.ID, s.name, message)
 
-	room.broadcastChat(s.name, message)
 	return nil
 }
 
 func (s *Session) handleStartGame(packet protocol.Packet) error {
-	room := s.Room()
-	if room == nil {
+	gameSession := s.GameSession()
+	if gameSession == nil {
 		return nil
 	}
-	// #region debug-point C:start-game-received
-	debugReport(debugRunID(), "C", "internal/relay/server.go:handleStartGame", "[DEBUG] start game packet received", map[string]any{
-		"sessionId": s.id,
-		"roomCode":  room.Code,
-		"players":   room.PlayerCount(),
-	})
-	// #endregion
-	if !room.CanModerate(s) {
-		s.systemMessage("只有房主或管理员可以开始游戏。")
-		return nil
-	}
-	room.SetInGame(true)
-	room.broadcastSystem(fmt.Sprintf("%s 开始了游戏", s.name))
-	room.broadcast(packet)
+
+	// TODO: Implement start game logic in game.Session
+	s.server.logger.Printf("player %s attempting to start game in session %s", s.name, gameSession.ID)
+
 	return nil
 }
 
 func (s *Session) handleReturnToBattleRoom(packet protocol.Packet) error {
-	room := s.Room()
-	if room == nil {
+	gameSession := s.GameSession()
+	if gameSession == nil {
 		return nil
 	}
-	room.SetInGame(false)
-	room.broadcast(packet)
-	_ = room.broadcastTeamList()
+
+	// TODO: Implement return to battle room logic in game.Session
+	s.server.logger.Printf("player %s is returning to battle room in session %s", s.name, gameSession.ID)
+
 	return nil
 }
 
 func (s *Session) handleGameCommand(packet protocol.Packet) error {
-	room := s.Room()
-	if room == nil {
+	gameSession := s.GameSession()
+	if gameSession == nil {
 		return nil
 	}
 
-	// This is where the change from the instruction is applied.
-	// The original implementation is replaced with one that wraps the command
-	// in a CommandRequest and sends it to a channel for processing.
-	// Note: This assumes other changes (like adding room.gameCommands channel
-	// and updating DecodeGameCommandPacket) are happening as part of the refactor.
-
-	gameCmd, err := protocol.DecodeGameCommandPacket(packet)
-	if err != nil {
-		return fmt.Errorf("decode game command: %w", err)
-	}
-
-	room.gameCommands <- CommandRequest{
-		Sender: s,
-		Packet: gameCmd,
-	}
+	// TODO: Implement game command handling in game.Session
+	s.server.logger.Printf("received game command in session %s", gameSession.ID)
 
 	return nil
 }
 
 func (s *Session) joinRoom(code string) error {
-	room, created, err := s.server.rooms.JoinOrCreate(code, s)
-	if err != nil {
-		// #region debug-point C:join-room-failed
-		debugReport(debugRunID(), "C", "internal/relay/server.go:joinRoom", "[DEBUG] join room failed", map[string]any{
-			"sessionId": s.id,
-			"roomCode":  code,
-			"error":     err.Error(),
-		})
-		// #endregion
-		return err
-	}
-	// #region debug-point C:join-room-success
-	debugReport(debugRunID(), "C", "internal/relay/server.go:joinRoom", "[DEBUG] join room success", map[string]any{
-		"sessionId": s.id,
-		"roomCode":  room.Code,
-		"created":   created,
-		"slot":      s.Slot(),
-		"players":   room.PlayerCount(),
-		"ownerId":   room.OwnerID,
+	gameSession := s.server.gameSessions.CreateSession(code)
+	gameSession.AddPlayer(&game.Player{
+		ID:   game.PlayerID(s.playerID),
+		Name: s.name,
 	})
-	// #endregion
+	s.gameSession = gameSession
+
+	s.server.logger.Printf("player %s joined game session %s", s.name, code)
 
 	s.state.Store(int32(stateActive))
-	roomScopedPrereq, preregisterErr := s.buildPreregisterPacket(room.ServerUUID)
-	if preregisterErr != nil {
-		return preregisterErr
-	}
-	if err := s.Send(roomScopedPrereq); err != nil {
-		return err
-	}
-	if err := s.Send(s.buildServerInfoPacket(room)); err != nil {
-		return err
-	}
-	if err := room.sendTeamListTo(s); err != nil {
-		return err
-	}
-
-	if created {
-		room.broadcastSystem(fmt.Sprintf("房间 %s 已创建", room.Code))
-	} else {
-		room.broadcastSystem(fmt.Sprintf("%s 加入了房间", s.name))
-	}
-	return room.broadcastTeamList()
-}
-
-func (s *Session) handleRoomCommand(room *Room, message string) error {
-	fields := strings.Fields(message)
-	if len(fields) == 0 {
-		return nil
-	}
-
-	switch strings.ToLower(fields[0]) {
-	case "/help":
-		s.systemMessage("可用命令: /players, /kick <槽位|玩家名>, /owner <槽位|玩家名>, /admin add|remove <槽位|玩家名>")
-	case "/players", "/list":
-		s.systemMessage(room.MembersText())
-	case "/kick":
-		if len(fields) < 2 {
-			s.systemMessage("用法: /kick <槽位|玩家名>")
-			return nil
-		}
-		target, err := room.FindTarget(strings.Join(fields[1:], " "))
-		if err != nil {
-			s.systemMessage(err.Error())
-			return nil
-		}
-		if target == s {
-			s.systemMessage("不能踢出自己。")
-			return nil
-		}
-		if err := room.Kick(s, target); err != nil {
-			s.systemMessage(err.Error())
-			return nil
-		}
-		room.broadcastSystem(fmt.Sprintf("%s 移出了 %s", s.name, target.name))
-	case "/owner", "/transfer":
-		if len(fields) < 2 {
-			s.systemMessage("用法: /owner <槽位|玩家名>")
-			return nil
-		}
-		target, err := room.FindTarget(strings.Join(fields[1:], " "))
-		if err != nil {
-			s.systemMessage(err.Error())
-			return nil
-		}
-		if err := room.TransferOwnership(s, target); err != nil {
-			s.systemMessage(err.Error())
-			return nil
-		}
-		room.broadcastSystem(fmt.Sprintf("%s 将房主转移给了 %s", s.name, target.name))
-		_ = room.broadcastTeamList()
-	case "/admin":
-		if len(fields) < 3 {
-			s.systemMessage("用法: /admin add|remove <槽位|玩家名>")
-			return nil
-		}
-		action := strings.ToLower(fields[1])
-		target, err := room.FindTarget(strings.Join(fields[2:], " "))
-		if err != nil {
-			s.systemMessage(err.Error())
-			return nil
-		}
-		switch action {
-		case "add":
-			if err := room.SetAdmin(s, target, true); err != nil {
-				s.systemMessage(err.Error())
-				return nil
-			}
-			room.broadcastSystem(fmt.Sprintf("%s 设定 %s 为管理员", s.name, target.name))
-			_ = room.broadcastTeamList()
-		case "remove":
-			if err := room.SetAdmin(s, target, false); err != nil {
-				s.systemMessage(err.Error())
-				return nil
-			}
-			room.broadcastSystem(fmt.Sprintf("%s 取消了 %s 的管理员", s.name, target.name))
-			_ = room.broadcastTeamList()
-		default:
-			s.systemMessage("用法: /admin add|remove <槽位|玩家名>")
-		}
-	default:
-		s.systemMessage("未知房间命令，使用 /help 查看可用命令。")
-	}
-
 	return nil
 }
 
@@ -633,18 +492,9 @@ func (s *Session) Send(packet protocol.Packet) error {
 	}
 }
 
-func (s *Session) systemMessage(message string) {
-	room := s.Room()
-	sender := "SERVER"
-	if room != nil {
-		sender = "ROOM"
-	}
-	_ = s.Send(buildChatPacket(sender, message, 5))
-}
-
 func (s *Session) close() {
 	s.once.Do(func() {
-		room := s.Room()
+		gameSession := s.GameSession()
 		// #region debug-point E:session-close
 		debugReport(debugRunID(), "E", "internal/relay/server.go:close", "[DEBUG] session closing", map[string]any{
 			"sessionId": s.id,
@@ -653,8 +503,8 @@ func (s *Session) close() {
 			"slot":      s.Slot(),
 			"state":     s.state.Load(),
 			"roomCode": func() string {
-				if room != nil {
-					return room.Code
+				if gameSession != nil {
+					return gameSession.ID
 				}
 				return ""
 			}(),
@@ -664,84 +514,32 @@ func (s *Session) close() {
 		close(s.closeCh)
 		_ = s.conn.Close()
 
-		if room != nil {
-			room.Leave(s)
-			_ = room.broadcastTeamList()
-			room.broadcastSystem(fmt.Sprintf("%s 离开了房间", s.name))
-			s.server.rooms.RemoveIfEmpty(room)
+		if gameSession != nil {
+			gameSession.RemovePlayer(game.PlayerID(s.playerID))
+			s.server.logger.Printf("player %s removed from game session %s", s.name, gameSession.ID)
 		}
 
 		s.server.logger.Printf("client disconnected: %s", s.conn.RemoteAddr())
 	})
 }
 
-func (s *Session) setRoom(room *Room, slot int) {
+func (s *Session) setGameSession(session *game.Session, slot int) {
 	s.roomMu.Lock()
 	defer s.roomMu.Unlock()
-	s.room = room
+	s.gameSession = session
 	s.slot = slot
 }
 
-func (s *Session) Room() *Room {
+func (s *Session) GameSession() *game.Session {
 	s.roomMu.RLock()
 	defer s.roomMu.RUnlock()
-	return s.room
+	return s.gameSession
 }
 
 func (s *Session) Slot() int {
 	s.roomMu.RLock()
 	defer s.roomMu.RUnlock()
 	return s.slot
-}
-
-func (s *Session) buildPreregisterPacket(uuid string) (protocol.Packet, error) {
-	w := protocol.NewWriter()
-	if err := w.String(s.server.cfg.ServerID); err != nil {
-		return protocol.Packet{}, err
-	}
-	w.Int32(1)
-	w.Int32(int32(s.clientVersion))
-	w.Int32(int32(s.clientVersion))
-	if err := w.String("com.corrodinggames.rts.server"); err != nil {
-		return protocol.Packet{}, err
-	}
-	if err := w.String(uuid); err != nil {
-		return protocol.Packet{}, err
-	}
-	w.Int32(javaHash("rwgin"))
-	return w.Packet(protocol.TypePreregister), nil
-}
-
-func (s *Session) buildRelayBecomeServerPacket(room *Room) protocol.Packet {
-	w := protocol.NewWriter()
-	w.Byte(2)
-	w.Bool(true)
-	w.Bool(true)
-	w.Bool(true)
-	protocol.RequireNoError(w.String(room.ServerUUID))
-	w.Bool(false)
-	w.Bool(false)
-	w.Bool(true)
-	protocol.RequireNoError(w.String(fmt.Sprintf("Room ID: %s\nRoom Name: %s", room.Code, room.Title)))
-	w.Bool(false)
-	protocol.RequireNoError(w.MaybeString(s.playerID))
-	return w.Packet(protocol.TypeRelayBecomeServer)
-}
-
-func (s *Session) buildServerInfoPacket(room *Room) protocol.Packet {
-	w := protocol.NewWriter()
-	protocol.RequireNoError(w.String(s.server.cfg.ServerID))
-	w.Int32(int32(s.clientVersion))
-	w.Int32(0)
-	protocol.RequireNoError(w.String(room.MapName))
-	w.Int32(0)
-	w.Int32(2)
-	w.Bool(true)
-	w.Int32(1)
-	w.Byte(0)
-	w.Bool(false)
-	w.Bool(false)
-	return w.Packet(protocol.TypeServerInfo)
 }
 
 func firstNonBlank(values ...string) string {

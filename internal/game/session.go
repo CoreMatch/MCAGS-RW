@@ -3,7 +3,7 @@ package game
 import "time"
 
 // PlayerID is the unique identifier for a player.
-type PlayerID int
+type PlayerID string
 
 // Player represents a player in the game session.
 type Player struct {
