@@ -442,9 +442,12 @@ func (s *Session) handleStartGame(packet protocol.Packet) error {
 		return nil
 	}
 
-	// TODO: Implement start game logic in game.Session
-	s.server.logger.Printf("player %s attempting to start game in session %s", s.name, gameSession.ID)
+	player := gameSession.GetPlayer(game.PlayerID(s.playerID))
+	if player == nil {
+		return nil // Player not found in session
+	}
 
+	gameSession.HandleStartGame(player)
 	return nil
 }
 

@@ -33,6 +33,8 @@ type GameState struct {
 // Session represents a single game session or room.
 type Session struct {
 	ID      string
+	OwnerID PlayerID // The ID of the player who owns the session. "system" for system-owned.
+	InGame  bool
 	players map[PlayerID]*Player
 	state   *GameState
 	ticker  *time.Ticker
@@ -43,6 +45,8 @@ type Session struct {
 func NewSession(id string) *Session {
 	return &Session{
 		ID:      id,
+		OwnerID: "system", // Default owner is the system
+		InGame:  false,
 		players: make(map[PlayerID]*Player),
 		state:   &GameState{},
 		quit:    make(chan struct{}),
@@ -96,6 +100,33 @@ func (s *Session) AddPlayer(player *Player) {
 	packet, err := protocol.EncodeSystemMessage(joinMsg)
 	if err == nil {
 		s.broadcast(packet, nil) // Broadcast to all, excluding no one
+	}
+}
+
+func (s *Session) HandleStartGame(starter *Player) {
+	if starter.ID != s.OwnerID {
+		// The player is not the owner, send them an error message.
+		errMsg := "Only the session owner can start the game."
+		packet, err := protocol.EncodeSystemMessage(errMsg)
+		if err == nil && starter.Conn != nil {
+			starter.Conn.Send(packet)
+		}
+		return
+	}
+
+	s.InGame = true
+
+	// Broadcast the start game message to all players.
+	startMsg := fmt.Sprintf("The game has been started by %s.", starter.Name)
+	packet, err := protocol.EncodeSystemMessage(startMsg)
+	if err == nil {
+		s.broadcast(packet, nil)
+	}
+
+	// Also broadcast the actual "start game" packet.
+	startGamePacket, err := protocol.EncodeStartGame()
+	if err == nil {
+		s.broadcast(startGamePacket, nil)
 	}
 }
 

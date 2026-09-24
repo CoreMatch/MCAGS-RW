@@ -226,6 +226,12 @@ func EncodeRelayVersionInfo(version int32) Packet {
 	return w.Packet(TypeRelayVersionInfo)
 }
 
+func EncodeStartGame() (Packet, error) {
+	w := NewWriter()
+	// The start game packet typically has no body.
+	return w.Packet(TypeStartGame), nil
+}
+
 func EncodeChat(from, message string) (Packet, error) {
 	w := NewWriter()
 	if err := w.String(from); err != nil {
