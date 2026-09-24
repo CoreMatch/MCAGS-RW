@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"rwgin/internal/config"
+	"rwgin/internal/game"
 	"rwgin/internal/protocol"
 )
 
@@ -103,6 +104,7 @@ func (m *Manager) Create(code, title string, maxPlayers int) (*Room, error) {
 		AISlot:       -1,
 		gameCommands: make(chan protocol.GameCommandPacket, 128),
 		stopCh:       make(chan struct{}),
+		gameState:    game.NewState(),
 	}
 	m.rooms[normalized] = room
 
@@ -187,6 +189,7 @@ type Room struct {
 	gameCommands chan protocol.GameCommandPacket
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
+	gameState    *game.State
 }
 
 func (r *Room) Summary() RoomSummary {
@@ -253,13 +256,43 @@ func (r *Room) processTick() {
 				// For now, we'll just rebroadcast chat messages.
 				// We might want to attribute this to a player later.
 				r.broadcastChat("Player", sc.Message)
+			case protocol.SubCommandUnitAddPacket:
+				// TODO: Resolve player ID from team index
+				r.gameState.AddUnit(sc.UnitType, sc.Owner, sc.X, sc.Y)
 			}
 		}
 	}
 
-	// TODO: Update game state (e.g., unit positions, projectiles).
+	// Broadcast game state updates.
+	dirtyUnits := r.gameState.CollectAndClearDirty()
+	if len(dirtyUnits) > 0 {
+		var w protocol.Writer
+		for _, unit := range dirtyUnits {
+			// TODO: This is not quite right. We are creating a new unit, but the client
+			// expects the server to assign the ID. The protocol for this is more complex.
+			// For now, we just broadcast the creation event back.
+			addCmd := protocol.SubCommandUnitAddPacket{
+				Count:      1,
+				UnitType:   unit.Type,
+				X:          unit.X,
+				Y:          unit.Y,
+				Owner:      unit.Owner,
+				ShouldSync: true,
+			}
+			_ = addCmd.Encode(&w)
+		}
 
-	// TODO: Broadcast game state updates.
+		if w.Len() > 0 {
+			gameCmd := protocol.GameCommandPacket{
+				Packet: protocol.Packet{
+					Type: protocol.TypeGameCommand,
+					Body: w.Bytes(),
+				},
+				Data: w.Bytes(),
+			}
+			r.Broadcast(&gameCmd)
+		}
+	}
 }
 
 func (r *Room) drainCommands() []protocol.GameCommandPacket {
