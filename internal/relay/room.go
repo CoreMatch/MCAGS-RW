@@ -90,19 +90,25 @@ func (m *Manager) Create(code, title string, maxPlayers int) (*Room, error) {
 	}
 
 	room := &Room{
-		Code:       normalized,
-		Title:      defaultIfBlank(title, m.cfg.DefaultRoomName+" "+normalized),
-		MapName:    m.cfg.DefaultMapName,
-		ServerUUID: randomHex(16),
-		MaxPlayers: maxPlayers,
-		MaxUnits:   m.cfg.DefaultMaxUnits,
-		Income:     m.cfg.DefaultIncome,
-		CreatedAt:  time.Now(),
-		players:    make([]*Session, maxPlayers),
-		adminIDs:   make(map[string]bool),
-		AISlot:     -1,
+		Code:         normalized,
+		Title:        defaultIfBlank(title, m.cfg.DefaultRoomName+" "+normalized),
+		MapName:      m.cfg.DefaultMapName,
+		ServerUUID:   randomHex(16),
+		MaxPlayers:   maxPlayers,
+		MaxUnits:     m.cfg.DefaultMaxUnits,
+		Income:       m.cfg.DefaultIncome,
+		CreatedAt:    time.Now(),
+		players:      make([]*Session, maxPlayers),
+		adminIDs:     make(map[string]bool),
+		AISlot:       -1,
+		gameCommands: make(chan protocol.GameCommandPacket, 128),
+		stopCh:       make(chan struct{}),
 	}
 	m.rooms[normalized] = room
+
+	room.wg.Add(1)
+	go room.run()
+
 	return room, nil
 }
 
@@ -172,12 +178,15 @@ type Room struct {
 	Income     float32
 	CreatedAt  time.Time
 
-	mu       sync.RWMutex
-	InGame   bool
-	OwnerID  string
-	players  []*Session
-	adminIDs map[string]bool
-	AISlot   int
+	mu           sync.RWMutex
+	InGame       bool
+	OwnerID      string
+	players      []*Session
+	adminIDs     map[string]bool
+	AISlot       int
+	gameCommands chan protocol.GameCommandPacket
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
 }
 
 func (r *Room) Summary() RoomSummary {
@@ -196,6 +205,61 @@ func (r *Room) Summary() RoomSummary {
 		OwnerName:  ownerName,
 		AdminCount: r.AdminCount(),
 		CreatedAt:  r.CreatedAt,
+	}
+}
+
+func (r *Room) run() {
+	defer r.wg.Done()
+
+	ticker := time.NewTicker(time.Second / 60)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			r.processTick()
+		case <-r.stopCh:
+			return
+		}
+	}
+}
+
+func (r *Room) Stop() {
+	close(r.stopCh)
+	r.wg.Wait()
+}
+
+func (r *Room) PushCommand(cmd protocol.GameCommandPacket) {
+	select {
+	case r.gameCommands <- cmd:
+	default:
+		// Dropping commands if the channel is full.
+		// Consider logging this event if it's important.
+	}
+}
+
+func (r *Room) processTick() {
+	commands := r.drainCommands()
+	if len(commands) > 0 {
+		// TODO: Process commands and update game state.
+		// For now, just broadcast them to all players.
+		r.Broadcast(commands...)
+	}
+
+	// TODO: Update game state (e.g., unit positions, projectiles).
+
+	// TODO: Broadcast game state updates.
+}
+
+func (r *Room) drainCommands() []protocol.Packet {
+	var packets []protocol.Packet
+	for {
+		select {
+		case cmd := <-r.gameCommands:
+			packets = append(packets, &cmd)
+		default:
+			return packets
+		}
 	}
 }
 

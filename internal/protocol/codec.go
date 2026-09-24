@@ -188,6 +188,17 @@ func (w *Writer) GzipSection(name string, fn func(section *Writer) error) error 
 	return nil
 }
 
+func DecodeGameCommandPacket(body []byte) (GameCommandPacket, error) {
+	r := NewReader(body)
+	if err := r.Skip(4); err != nil {
+		return GameCommandPacket{}, err
+	}
+	return GameCommandPacket{
+		Packet: Packet{Type: TypeGameCommand, Body: body},
+		Data:   r.data[r.off:],
+	}, nil
+}
+
 func DecodePromptReply(body []byte) (string, error) {
 	r := NewReader(body)
 	if err := r.Skip(5); err != nil {

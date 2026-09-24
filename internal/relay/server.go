@@ -292,6 +292,8 @@ func (s *Session) handlePacket(packet protocol.Packet) error {
 		return s.handleStartGame(packet)
 	case protocol.TypeReturnToBattleRoom:
 		return s.handleReturnToBattleRoom(packet)
+	case protocol.TypeGameCommand:
+		return s.handleGameCommand(packet)
 	case protocol.TypeDisconnect:
 		return errors.New("client requested disconnect")
 	default:
@@ -458,6 +460,25 @@ func (s *Session) handleReturnToBattleRoom(packet protocol.Packet) error {
 	room.SetInGame(false)
 	room.broadcast(packet)
 	_ = room.broadcastTeamList()
+	return nil
+}
+
+func (s *Session) handleGameCommand(packet protocol.Packet) error {
+	room := s.Room()
+	if room == nil {
+		return nil
+	}
+
+	cmdPacket, ok := packet.(*protocol.GameCommandPacket)
+	if !ok {
+		p, err := protocol.DecodeGameCommandPacket(packet.Body)
+		if err != nil {
+			return err
+		}
+		cmdPacket = &p
+	}
+
+	room.PushCommand(*cmdPacket)
 	return nil
 }
 

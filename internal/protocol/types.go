@@ -17,9 +17,15 @@ const (
 	TypeRelayPromptReply   = 118
 	TypeRelayVersionInfo   = 163
 	TypeRelayBecomeServer  = 170
+	TypeGameCommand        = 116
 )
 
 type Packet struct {
 	Type int32
 	Body []byte
+}
+
+type GameCommandPacket struct {
+	Packet
+	Data []byte
 }
