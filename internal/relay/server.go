@@ -427,9 +427,12 @@ func (s *Session) handleChat(body []byte) error {
 		return nil
 	}
 
-	// TODO: Implement chat handling in game.Session
-	s.server.logger.Printf("chat in session %s from %s: %s", gameSession.ID, s.name, message)
+	player := gameSession.GetPlayer(game.PlayerID(s.playerID))
+	if player == nil {
+		return nil // Player not found in session
+	}
 
+	gameSession.HandleChatMessage(player, message)
 	return nil
 }
 
@@ -474,6 +477,7 @@ func (s *Session) joinRoom(code string) error {
 	gameSession.AddPlayer(&game.Player{
 		ID:   game.PlayerID(s.playerID),
 		Name: s.name,
+		Conn: s, // s (the relay.Session) implements game.PlayerConn
 	})
 	s.gameSession = gameSession
 

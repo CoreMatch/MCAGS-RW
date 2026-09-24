@@ -1,14 +1,25 @@
 package game
 
-import "time"
+import (
+	"fmt"
+	"rwgin/internal/protocol"
+	"time"
+)
 
 // PlayerID is the unique identifier for a player.
 type PlayerID string
+
+// PlayerConn represents the network connection for a player.
+// It is an interface to decouple the game logic from the network layer.
+type PlayerConn interface {
+	Send(packet protocol.Packet) error
+}
 
 // Player represents a player in the game session.
 type Player struct {
 	ID   PlayerID
 	Name string
+	Conn PlayerConn
 	// Add other player-specific data here, like team, resources, etc.
 }
 
@@ -68,9 +79,40 @@ func (s *Session) update() {
 	// 3. Broadcast state to players (we'll add this later)
 }
 
-// AddPlayer adds a player to the session.
+// GetPlayer retrieves a player from the session by their ID.
+func (s *Session) GetPlayer(id PlayerID) *Player {
+	// Note: This is a simple implementation. For sessions with many players,
+	// we might want to use a more efficient data structure.
+	player, _ := s.players[id]
+	return player
+}
+
+// AddPlayer adds a player to the session and broadcasts their arrival.
 func (s *Session) AddPlayer(player *Player) {
 	s.players[player.ID] = player
+
+	// Broadcast the new player's arrival to all players in the session.
+	joinMsg := fmt.Sprintf("%s has joined the game.", player.Name)
+	packet, err := protocol.EncodeSystemMessage(joinMsg)
+	if err == nil {
+		s.broadcast(packet, nil) // Broadcast to all, excluding no one
+	}
+}
+
+func (s *Session) HandleChatMessage(from *Player, message string) {
+	packet, err := protocol.EncodeChat(from.Name, message)
+	if err == nil {
+		s.broadcast(packet, from.ID) // Broadcast to all, excluding the sender
+	}
+}
+
+// broadcast sends a packet to all players in the session, optionally excluding one.
+func (s *Session) broadcast(packet protocol.Packet, exclude PlayerID) {
+	for id, player := range s.players {
+		if id != exclude && player.Conn != nil {
+			player.Conn.Send(packet)
+		}
+	}
 }
 
 // RemovePlayer removes a player from the session.

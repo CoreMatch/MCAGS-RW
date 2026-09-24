@@ -226,6 +226,21 @@ func EncodeRelayVersionInfo(version int32) Packet {
 	return w.Packet(TypeRelayVersionInfo)
 }
 
+func EncodeChat(from, message string) (Packet, error) {
+	w := NewWriter()
+	if err := w.String(from); err != nil {
+		return Packet{}, err
+	}
+	if err := w.String(message); err != nil {
+		return Packet{}, err
+	}
+	return w.Packet(TypeChatBroadcast), nil
+}
+
+func EncodeSystemMessage(message string) (Packet, error) {
+	return EncodeChat("SERVER", message)
+}
+
 func DecodeChatReceive(body []byte) (string, error) {
 	r := NewReader(body)
 	return r.String()
