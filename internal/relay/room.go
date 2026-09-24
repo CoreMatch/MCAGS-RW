@@ -259,27 +259,44 @@ func (r *Room) processTick() {
 			case protocol.SubCommandUnitAddPacket:
 				// TODO: Resolve player ID from team index
 				r.gameState.AddUnit(sc.UnitType, sc.Owner, sc.X, sc.Y)
+			case protocol.SubCommandUnitMovePacket:
+				ids := make([]game.UnitID, len(sc.UnitIDs))
+				for i, id := range sc.UnitIDs {
+					ids[i] = game.UnitID(id)
+				}
+				r.gameState.MoveUnits(ids, sc.X, sc.Y)
 			}
 		}
 	}
 
 	// Broadcast game state updates.
-	dirtyUnits := r.gameState.CollectAndClearDirty()
-	if len(dirtyUnits) > 0 {
+	changes := r.gameState.CollectAndClearChanges()
+	if len(changes) > 0 {
 		var w protocol.Writer
-		for _, unit := range dirtyUnits {
-			// TODO: This is not quite right. We are creating a new unit, but the client
-			// expects the server to assign the ID. The protocol for this is more complex.
-			// For now, we just broadcast the creation event back.
-			addCmd := protocol.SubCommandUnitAddPacket{
-				Count:      1,
-				UnitType:   unit.Type,
-				X:          unit.X,
-				Y:          unit.Y,
-				Owner:      unit.Owner,
-				ShouldSync: true,
+		for unitID, changeType := range changes {
+			unit, ok := r.gameState.GetUnit(unitID)
+			if !ok {
+				continue
 			}
-			_ = addCmd.Encode(&w)
+
+			switch changeType {
+			case game.ChangeTypeCreated:
+				addCmd := protocol.SubCommandServerUnitAddPacket{
+					UnitID:   int64(unit.ID),
+					UnitType: unit.Type,
+					X:        unit.X,
+					Y:        unit.Y,
+					Owner:    unit.Owner,
+				}
+				_ = addCmd.Encode(&w)
+			case game.ChangeTypeMoved:
+				moveCmd := protocol.SubCommandServerUnitMovePacket{
+					UnitID: int64(unit.ID),
+					X:      unit.X,
+					Y:      unit.Y,
+				}
+				_ = moveCmd.Encode(&w)
+			}
 		}
 
 		if w.Len() > 0 {
