@@ -150,6 +150,9 @@ func shouldDebugPacket(packetType int32) bool {
 	case protocol.TypePreregisterReceive,
 		protocol.TypePreregister,
 		protocol.TypeRegisterPlayer,
+		protocol.TypeHeartbeat,
+		protocol.TypeHeartbeatResponse,
+		protocol.TypeDisconnect,
 		protocol.TypeRelayVersionInfo,
 		protocol.TypeRelayPrompt,
 		protocol.TypeRelayPromptReply,
@@ -164,7 +167,7 @@ func shouldDebugPacket(packetType int32) bool {
 }
 
 func debugRunID() string {
-	return "pre-fix"
+	return "post-fix"
 }
 
 // #endregion
@@ -207,6 +210,13 @@ func (s *Session) run(ctx context.Context) {
 		_ = s.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		packet, err := protocol.ReadPacket(s.conn)
 		if err != nil {
+			// #region debug-point E:read-error-close
+			debugReport(debugRunID(), "E", "internal/relay/server.go:run", "[DEBUG] read loop ended", map[string]any{
+				"sessionId": s.id,
+				"state":     s.state.Load(),
+				"error":     err.Error(),
+			})
+			// #endregion
 			return
 		}
 		// #region debug-point A:packet-in
@@ -218,9 +228,25 @@ func (s *Session) run(ctx context.Context) {
 			})
 		}
 		// #endregion
+		// #region debug-point E:active-packet-in
+		if sessionState(s.state.Load()) == stateActive {
+			debugReport(debugRunID(), "E", "internal/relay/server.go:run", "[DEBUG] active session inbound packet", map[string]any{
+				"sessionId": s.id,
+				"type":      packet.Type,
+				"size":      len(packet.Body),
+			})
+		}
+		// #endregion
 
 		if err := s.handlePacket(packet); err != nil {
 			s.server.logger.Printf("session %s handle packet %d failed: %v", s.id, packet.Type, err)
+			// #region debug-point E:handle-error-close
+			debugReport(debugRunID(), "E", "internal/relay/server.go:run", "[DEBUG] handle packet failed", map[string]any{
+				"sessionId": s.id,
+				"type":      packet.Type,
+				"error":     err.Error(),
+			})
+			// #endregion
 			return
 		}
 	}
@@ -311,6 +337,21 @@ func (s *Session) handlePreregister(body []byte) error {
 
 func (s *Session) handleRegister(body []byte) error {
 	if sessionState(s.state.Load()) != stateAwaitRegister {
+		decodedName, decodedPlayerID, decodeErr := protocol.DecodeRegister(body)
+		// #region debug-point E:register-while-active
+		debugReport(debugRunID(), "E", "internal/relay/server.go:handleRegister", "[DEBUG] register packet received outside await-register", map[string]any{
+			"sessionId":       s.id,
+			"state":           s.state.Load(),
+			"decodedName":     decodedName,
+			"decodedPlayerId": decodedPlayerID,
+			"decodeError": func() string {
+				if decodeErr != nil {
+					return decodeErr.Error()
+				}
+				return ""
+			}(),
+		})
+		// #endregion
 		return nil
 	}
 
@@ -392,6 +433,13 @@ func (s *Session) handleStartGame(packet protocol.Packet) error {
 	if room == nil {
 		return nil
 	}
+	// #region debug-point C:start-game-received
+	debugReport(debugRunID(), "C", "internal/relay/server.go:handleStartGame", "[DEBUG] start game packet received", map[string]any{
+		"sessionId": s.id,
+		"roomCode":  room.Code,
+		"players":   room.PlayerCount(),
+	})
+	// #endregion
 	if !room.CanModerate(s) {
 		s.systemMessage("只有房主或管理员可以开始游戏。")
 		return nil
@@ -437,10 +485,6 @@ func (s *Session) joinRoom(code string) error {
 	// #endregion
 
 	s.state.Store(int32(stateActive))
-
-	if err := s.Send(s.buildRelayBecomeServerPacket(room)); err != nil {
-		return err
-	}
 	roomScopedPrereq, preregisterErr := s.buildPreregisterPacket(room.ServerUUID)
 	if preregisterErr != nil {
 		return preregisterErr
@@ -565,11 +609,26 @@ func (s *Session) systemMessage(message string) {
 
 func (s *Session) close() {
 	s.once.Do(func() {
+		room := s.Room()
+		// #region debug-point E:session-close
+		debugReport(debugRunID(), "E", "internal/relay/server.go:close", "[DEBUG] session closing", map[string]any{
+			"sessionId": s.id,
+			"playerId":  s.playerID,
+			"name":      s.name,
+			"slot":      s.Slot(),
+			"state":     s.state.Load(),
+			"roomCode": func() string {
+				if room != nil {
+					return room.Code
+				}
+				return ""
+			}(),
+		})
+		// #endregion
 		s.state.Store(int32(stateClosed))
 		close(s.closeCh)
 		_ = s.conn.Close()
 
-		room := s.Room()
 		if room != nil {
 			room.Leave(s)
 			_ = room.broadcastTeamList()

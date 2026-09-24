@@ -32,6 +32,7 @@ type RoomPlayerSummary struct {
 	Slot     int    `json:"slot"`
 	IsOwner  bool   `json:"isOwner"`
 	IsAdmin  bool   `json:"isAdmin"`
+	IsAI     bool   `json:"isAi"`
 }
 
 type RoomDetail struct {
@@ -99,6 +100,7 @@ func (m *Manager) Create(code, title string, maxPlayers int) (*Room, error) {
 		CreatedAt:  time.Now(),
 		players:    make([]*Session, maxPlayers),
 		adminIDs:   make(map[string]bool),
+		AISlot:     -1,
 	}
 	m.rooms[normalized] = room
 	return room, nil
@@ -175,6 +177,7 @@ type Room struct {
 	OwnerID  string
 	players  []*Session
 	adminIDs map[string]bool
+	AISlot   int
 }
 
 func (r *Room) Summary() RoomSummary {
@@ -202,20 +205,32 @@ func (r *Room) Detail() RoomDetail {
 
 	members := make([]RoomPlayerSummary, 0, len(r.players))
 	ownerName := ""
-	for _, session := range r.players {
-		if session == nil {
+	for slot, participant := range r.slotParticipantsLocked() {
+		if participant == nil {
 			continue
 		}
-		isOwner := session.playerID == r.OwnerID
-		if isOwner {
-			ownerName = session.name
+		if participant.session != nil {
+			isOwner := participant.session.playerID == r.OwnerID
+			if isOwner {
+				ownerName = participant.name
+			}
+			members = append(members, RoomPlayerSummary{
+				PlayerID: participant.session.playerID,
+				Name:     participant.name,
+				Slot:     slot,
+				IsOwner:  isOwner,
+				IsAdmin:  r.adminIDs[participant.session.playerID],
+				IsAI:     false,
+			})
+			continue
 		}
 		members = append(members, RoomPlayerSummary{
-			PlayerID: session.playerID,
-			Name:     session.name,
-			Slot:     session.Slot(),
-			IsOwner:  isOwner,
-			IsAdmin:  r.adminIDs[session.playerID],
+			PlayerID: "AI",
+			Name:     participant.name,
+			Slot:     slot,
+			IsOwner:  false,
+			IsAdmin:  false,
+			IsAI:     true,
 		})
 	}
 
@@ -240,6 +255,7 @@ func (r *Room) Join(session *Session) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	r.syncAutoAILockedForJoin()
 	for idx, existing := range r.players {
 		if existing == nil {
 			r.players[idx] = session
@@ -248,6 +264,7 @@ func (r *Room) Join(session *Session) error {
 				r.OwnerID = session.playerID
 				r.adminIDs[session.playerID] = true
 			}
+			r.syncAutoAILocked()
 			return nil
 		}
 	}
@@ -269,6 +286,7 @@ func (r *Room) Leave(session *Session) {
 			if r.PlayerCountLocked() == 0 {
 				r.InGame = false
 			}
+			r.syncAutoAILocked()
 			return
 		}
 	}
@@ -281,6 +299,19 @@ func (r *Room) PlayerCount() int {
 }
 
 func (r *Room) PlayerCountLocked() int {
+	count := 0
+	for _, player := range r.players {
+		if player != nil {
+			count++
+		}
+	}
+	if r.AISlot >= 0 {
+		count++
+	}
+	return count
+}
+
+func (r *Room) HumanCountLocked() int {
 	count := 0
 	for _, player := range r.players {
 		if player != nil {
@@ -456,7 +487,9 @@ func (r *Room) MembersText() string {
 	lines := make([]string, 0, len(detail.Members))
 	for _, member := range detail.Members {
 		role := "player"
-		if member.IsOwner {
+		if member.IsAI {
+			role = "ai"
+		} else if member.IsOwner {
 			role = "owner"
 		} else if member.IsAdmin {
 			role = "admin"
@@ -521,32 +554,71 @@ func (r *Room) buildTeamListPacket(player *Session) (protocol.Packet, error) {
 	w.Bool(false)
 	w.Int32(int32(r.MaxPlayers))
 
-	players := r.SnapshotPlayers()
+	r.mu.RLock()
+	participants := r.slotParticipantsLocked()
+	debugSlots := make([]map[string]any, 0, len(participants))
+	for slot, member := range participants {
+		if member == nil {
+			debugSlots = append(debugSlots, map[string]any{
+				"slot": slot,
+				"name": "",
+				"kind": "empty",
+			})
+			continue
+		}
+		kind := "ai"
+		if member.session != nil {
+			kind = "human"
+		}
+		debugSlots = append(debugSlots, map[string]any{
+			"slot": slot,
+			"name": member.name,
+			"kind": kind,
+		})
+	}
+	r.mu.RUnlock()
+	// #region debug-point D:team-list-slots
+	debugReport(debugRunID(), "D", "internal/relay/room.go:buildTeamListPacket", "[DEBUG] team list slot mapping", map[string]any{
+		"roomCode":     r.Code,
+		"forPlayer":    player.name,
+		"forSlot":      player.Slot(),
+		"participants": debugSlots,
+	})
+	// #endregion
 	if err := w.GzipSection("teams", func(section *protocol.Writer) error {
-		for _, member := range players {
+		for slot, member := range participants {
 			if member == nil {
 				section.Bool(false)
 				continue
 			}
 
 			section.Bool(true)
-			section.Raw(make([]byte, 13))
-			if err := section.MaybeString(member.name); err != nil {
+			roleInt := int32(0)
+			if member.session != nil && r.adminIDs[member.session.playerID] {
+				roleInt = 1
+			}
+			slotPayload, err := buildTeamSlotPayload(slot, member, roleInt)
+			if err != nil {
 				return err
 			}
-			section.Raw(make([]byte, 32))
-			if member.playerID == r.OwnerID {
-				section.Int32(1)
-			} else {
-				section.Int32(0)
-			}
-			for i := 0; i < 4; i++ {
-				section.Bool(false)
-			}
-			section.Int32(0)
-		}
-		for i := len(players); i < r.MaxPlayers; i++ {
-			section.Bool(false)
+			payloadBytes := append([]byte(nil), slotPayload.Bytes()...)
+			section.Raw(payloadBytes)
+			// #region debug-point D:team-list-slot-bytes
+			debugReport(debugRunID(), "D", "internal/relay/room.go:buildTeamListPacket", "[DEBUG] team list slot payload", map[string]any{
+				"roomCode": r.Code,
+				"slot":     slot,
+				"name":     member.name,
+				"kind": func() string {
+					if member.session != nil {
+						return "human"
+					}
+					return "ai"
+				}(),
+				"roleInt":    roleInt,
+				"payloadLen": len(payloadBytes),
+				"payloadHex": hex.EncodeToString(payloadBytes),
+			})
+			// #endregion
 		}
 		return nil
 	}); err != nil {
@@ -568,6 +640,57 @@ func (r *Room) buildTeamListPacket(player *Session) (protocol.Packet, error) {
 	w.Bool(false)
 	w.Bool(false)
 	return w.Packet(protocol.TypeTeamList), nil
+}
+
+func buildTeamSlotPayload(slot int, member *slotParticipant, roleInt int32) (*protocol.Writer, error) {
+	w := protocol.NewWriter()
+
+	// 示例项目中的 TEAM_LIST 解析表明，单槽位在名字前至少包含 13 字节：
+	// Int + Byte + Int + Int
+	w.Int32(int32(slot))
+	w.Byte(byte(slot))
+	w.Int32(0)
+	w.Int32(int32(slot))
+
+	if err := w.MaybeString(member.name); err != nil {
+		return nil, err
+	}
+
+	// 名字后按示例项目的读取顺序写入：
+	// Boolean
+	// Int + Long
+	// Boolean + Int
+	// Int + Byte
+	// Boolean * 2
+	// Boolean * 2 + Int
+	// IsString + Int
+	// IsInt * 4
+	// Int
+	w.Bool(false)
+	w.Int32(0)
+	w.Int64(0)
+	w.Bool(false)
+	w.Int32(0)
+	w.Int32(0)
+	w.Byte(0)
+	w.Bool(false)
+	w.Bool(false)
+	w.Bool(false)
+	w.Bool(false)
+	w.Int32(0)
+	if err := w.MaybeString(""); err != nil {
+		return nil, err
+	}
+
+	// 这一位在示例项目里会被覆盖成 admin 标记。
+	w.Int32(roleInt)
+
+	for i := 0; i < 4; i++ {
+		w.Bool(false)
+	}
+	w.Int32(0)
+
+	return w, nil
 }
 
 func randomCode(length int) string {
@@ -624,6 +747,65 @@ func (r *Room) promoteSuccessorLocked() {
 			r.adminIDs[member.playerID] = true
 			return
 		}
+	}
+}
+
+type slotParticipant struct {
+	name    string
+	session *Session
+}
+
+func (r *Room) slotParticipantsLocked() []*slotParticipant {
+	participants := make([]*slotParticipant, len(r.players))
+	for slot, member := range r.players {
+		if member != nil {
+			participants[slot] = &slotParticipant{
+				name:    member.name,
+				session: member,
+			}
+		}
+	}
+	if r.AISlot >= 0 && r.AISlot < len(participants) && participants[r.AISlot] == nil {
+		participants[r.AISlot] = &slotParticipant{
+			name:    "AI",
+			session: nil,
+		}
+	}
+	return participants
+}
+
+func (r *Room) firstEmptySlotLocked() int {
+	for idx, member := range r.players {
+		if member == nil && idx != r.AISlot {
+			return idx
+		}
+	}
+	for idx, member := range r.players {
+		if member == nil {
+			return idx
+		}
+	}
+	return -1
+}
+
+func (r *Room) syncAutoAILockedForJoin() {
+	if r.HumanCountLocked() >= 1 {
+		r.AISlot = -1
+	}
+}
+
+func (r *Room) syncAutoAILocked() {
+	humanCount := r.HumanCountLocked()
+	switch humanCount {
+	case 0:
+		r.AISlot = -1
+	case 1:
+		if r.AISlot >= 0 {
+			return
+		}
+		r.AISlot = r.firstEmptySlotLocked()
+	default:
+		r.AISlot = -1
 	}
 }
 
