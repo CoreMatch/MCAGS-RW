@@ -276,6 +276,14 @@ func (s *Session) writeLoop() {
 	}
 }
 
+func (s *Session) ID() string {
+	return s.playerID
+}
+
+func (s *Session) Name() string {
+	return s.name
+}
+
 func (s *Session) handlePacket(packet protocol.Packet) error {
 	switch packet.Type {
 	case protocol.TypePreregisterReceive:
@@ -469,16 +477,22 @@ func (s *Session) handleGameCommand(packet protocol.Packet) error {
 		return nil
 	}
 
-	cmdPacket, ok := packet.(*protocol.GameCommandPacket)
-	if !ok {
-		p, err := protocol.DecodeGameCommandPacket(packet.Body)
-		if err != nil {
-			return err
-		}
-		cmdPacket = &p
+	// This is where the change from the instruction is applied.
+	// The original implementation is replaced with one that wraps the command
+	// in a CommandRequest and sends it to a channel for processing.
+	// Note: This assumes other changes (like adding room.gameCommands channel
+	// and updating DecodeGameCommandPacket) are happening as part of the refactor.
+
+	gameCmd, err := protocol.DecodeGameCommandPacket(packet)
+	if err != nil {
+		return fmt.Errorf("decode game command: %w", err)
 	}
 
-	room.PushCommand(*cmdPacket)
+	room.gameCommands <- CommandRequest{
+		Sender: s,
+		Packet: gameCmd,
+	}
+
 	return nil
 }
 

@@ -170,6 +170,24 @@ func (m *Manager) nextCode() string {
 	}
 }
 
+// Identity represents the source of a command or the owner of a unit.
+type Identity interface {
+	ID() string   // A unique identifier (e.g., PlayerID for a session, "system" for the server)
+	Name() string // A display name (e.g., player's name, "AI Player 1", "System")
+}
+
+// SystemIdentity represents the server itself.
+type SystemIdentity struct{}
+
+func (s SystemIdentity) ID() string   { return "system" }
+func (s SystemIdentity) Name() string { return "System" }
+
+// CommandRequest wraps a game command with the identity of its sender.
+type CommandRequest struct {
+	Sender Identity
+	Packet protocol.GameCommandPacket
+}
+
 type Room struct {
 	Code       string
 	Title      string
@@ -186,7 +204,7 @@ type Room struct {
 	players      []*Session
 	adminIDs     map[string]bool
 	AISlot       int
-	gameCommands chan protocol.GameCommandPacket
+	gameCommands chan CommandRequest
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
 	gameState    *game.State
@@ -232,7 +250,7 @@ func (r *Room) Stop() {
 	r.wg.Wait()
 }
 
-func (r *Room) PushCommand(cmd protocol.GameCommandPacket) {
+func (r *Room) PushCommand(cmd CommandRequest) {
 	select {
 	case r.gameCommands <- cmd:
 	default:
@@ -243,8 +261,8 @@ func (r *Room) PushCommand(cmd protocol.GameCommandPacket) {
 
 func (r *Room) processTick() {
 	commands := r.drainCommands()
-	for _, cmd := range commands {
-		subCommands, err := protocol.ParseSubCommands(cmd.Data)
+	for _, cmdRequest := range commands {
+		subCommands, err := protocol.ParseSubCommands(cmdRequest.Packet.Data)
 		if err != nil {
 			// Consider logging this error
 			continue
@@ -253,17 +271,15 @@ func (r *Room) processTick() {
 		for _, subCmd := range subCommands {
 			switch sc := subCmd.(type) {
 			case protocol.SubCommandChatPacket:
-				// For now, we'll just rebroadcast chat messages.
-				// We might want to attribute this to a player later.
-				r.broadcastChat("Player", sc.Message)
+				r.broadcastChat(cmdRequest.Sender.Name(), sc.Message)
 			case protocol.SubCommandUnitAddPacket:
-				// TODO: Resolve player ID from team index
-				r.gameState.AddUnit(sc.UnitType, sc.Owner, sc.X, sc.Y)
+				r.gameState.AddUnit(sc.UnitType, cmdRequest.Sender.ID(), sc.X, sc.Y)
 			case protocol.SubCommandUnitMovePacket:
 				ids := make([]game.UnitID, len(sc.UnitIDs))
 				for i, id := range sc.UnitIDs {
 					ids[i] = game.UnitID(id)
 				}
+				// TODO: Add security check: does cmdRequest.Sender own these units?
 				r.gameState.MoveUnits(ids, sc.X, sc.Y)
 			}
 		}
@@ -286,7 +302,7 @@ func (r *Room) processTick() {
 					UnitType: unit.Type,
 					X:        unit.X,
 					Y:        unit.Y,
-					Owner:    unit.Owner,
+					Owner:    unit.Owner, // This now correctly holds the PlayerID
 				}
 				_ = addCmd.Encode(&w)
 			case game.ChangeTypeMoved:
@@ -312,8 +328,8 @@ func (r *Room) processTick() {
 	}
 }
 
-func (r *Room) drainCommands() []protocol.GameCommandPacket {
-	var packets []protocol.GameCommandPacket
+func (r *Room) drainCommands() []CommandRequest {
+	var packets []CommandRequest
 	for {
 		select {
 		case cmd := <-r.gameCommands:
