@@ -240,10 +240,21 @@ func (r *Room) PushCommand(cmd protocol.GameCommandPacket) {
 
 func (r *Room) processTick() {
 	commands := r.drainCommands()
-	if len(commands) > 0 {
-		// TODO: Process commands and update game state.
-		// For now, just broadcast them to all players.
-		r.Broadcast(commands...)
+	for _, cmd := range commands {
+		subCommands, err := protocol.ParseSubCommands(cmd.Data)
+		if err != nil {
+			// Consider logging this error
+			continue
+		}
+
+		for _, subCmd := range subCommands {
+			switch sc := subCmd.(type) {
+			case protocol.SubCommandChatPacket:
+				// For now, we'll just rebroadcast chat messages.
+				// We might want to attribute this to a player later.
+				r.broadcastChat("Player", sc.Message)
+			}
+		}
 	}
 
 	// TODO: Update game state (e.g., unit positions, projectiles).
@@ -251,12 +262,12 @@ func (r *Room) processTick() {
 	// TODO: Broadcast game state updates.
 }
 
-func (r *Room) drainCommands() []protocol.Packet {
-	var packets []protocol.Packet
+func (r *Room) drainCommands() []protocol.GameCommandPacket {
+	var packets []protocol.GameCommandPacket
 	for {
 		select {
 		case cmd := <-r.gameCommands:
-			packets = append(packets, &cmd)
+			packets = append(packets, cmd)
 		default:
 			return packets
 		}
