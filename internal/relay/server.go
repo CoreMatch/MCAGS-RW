@@ -469,9 +469,12 @@ func (s *Session) handleGameCommand(packet protocol.Packet) error {
 		return nil
 	}
 
-	// TODO: Implement game command handling in game.Session
-	s.server.logger.Printf("received game command in session %s", gameSession.ID)
+	player := gameSession.GetPlayer(game.PlayerID(s.playerID))
+	if player == nil {
+		return nil // Player not found in session
+	}
 
+	gameSession.SubmitCommand(player, packet)
 	return nil
 }
 
